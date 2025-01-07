@@ -1,54 +1,78 @@
 // server/routes/watermark.routes.js
+
 const router = require('express').Router();
 const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
 const watermarkController = require('../controllers/watermark.controller');
 const authMiddleware = require('../middleware/auth.middleware');
 
-// Configure multer for memory storage
-const upload = multer({
-  limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB limit
-  },
-  fileFilter: (req, file, cb) => {
-    // Accept images only
-    if (!file.originalname.match(/\.(jpg|jpeg|png|gif)$/)) {
-      return cb(new Error('Only image files are allowed!'), false);
+// Configure multer for disk storage for /upload
+const storageDisk = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadPath = path.join(__dirname, '..', 'uploads');
+    if (!fs.existsSync(uploadPath)){
+      fs.mkdirSync(uploadPath, { recursive: true });
     }
-    if (!file.mimetype.startsWith('image/')) {
-      return cb(new Error('Only image files are allowed!'), false);
+    cb(null, uploadPath);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
+  }
+});
+const uploadDisk = multer({ storage: storageDisk });
+
+// Configure multer for memory storage
+const uploadMemory = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!file.originalname.match(/\.(jpg|jpeg|png)$/)) {
+      return cb(new Error('Only JPG and PNG files are allowed.'), false);
     }
     cb(null, true);
   }
 });
 
-// Error handling middleware for multer
-const uploadMiddleware = (req, res, next) => {
-  upload.single('image')(req, res, (err) => {
+// Error handling middleware for disk upload
+const uploadDiskMiddleware = (req, res, next) => {
+  uploadDisk.single('image')(req, res, (err) => {
     if (err instanceof multer.MulterError) {
-      // A Multer error occurred when uploading
-      return res.status(400).json({
-        message: 'File upload error',
-        error: err.message
-      });
+      // A Multer error occurred when uploading.
+      return res.status(400).json({ message: 'File upload error.', error: err.message });
     } else if (err) {
-      // An unknown error occurred when uploading
-      return res.status(400).json({
-        message: 'File upload error',
-        error: err.message
-      });
+      // An unknown error occurred when uploading.
+      return res.status(400).json({ message: 'File upload error.', error: err.message });
     }
-    // Everything went fine
+    // Everything went fine.
     next();
   });
 };
 
-router.post('/upload', 
-  authMiddleware, 
-  uploadMiddleware,
+// Simplified middleware
+const uploadMiddleware = (req, res, next) => {
+  uploadMemory.single('image')(req, res, (err) => {
+    if (err) {
+      return res.status(400).json({ 
+        message: 'File upload error', 
+        error: err.message 
+      });
+    }
+    next();
+  });
+};
+
+// POST /watermark/upload
+router.post('/upload',
+  authMiddleware,
+  uploadDiskMiddleware,
   watermarkController.uploadImage
 );
 
+// POST /watermark/verify
 router.post('/verify',
+  authMiddleware,
   uploadMiddleware,
   watermarkController.verifyImage
 );

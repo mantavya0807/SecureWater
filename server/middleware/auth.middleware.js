@@ -1,20 +1,33 @@
 // server/middleware/auth.middleware.js
-const jwt = require('jsonwebtoken');
 
-const authMiddleware = (req, res, next) => {
+const jwt = require('jsonwebtoken');
+const User = require('../models/user.model');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret_key';
+
+const auth = async (req, res, next) => {
+  const authHeader = req.header('Authorization');
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ message: 'No token, authorization denied.' });
+  }
+
+  const token = authHeader.split(' ')[1];
+
   try {
-    const token = req.header('Authorization')?.replace('Bearer ', '');
-    
-    if (!token) {
-      return res.status(401).json({ message: 'No token, authorization denied' });
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await User.findById(decoded.id).select('-password');
+
+    if (!user) {
+      return res.status(401).json({ message: 'User not found, authorization denied.' });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded;
+    req.user = user; // Attach user to request
     next();
-  } catch (error) {
-    res.status(401).json({ message: 'Token is not valid' });
+  } catch (err) {
+    console.error(err);
+    res.status(401).json({ message: 'Token is not valid.' });
   }
 };
 
-module.exports = authMiddleware;
+module.exports = auth;

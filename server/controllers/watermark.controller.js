@@ -1,217 +1,159 @@
+// server/controllers/watermark.controller.js
+
 const Image = require('../models/image.model');
 const User = require('../models/user.model');
-const sharp = require('sharp');
+const path = require('path');
+const fs = require('fs');
+const Jimp = require('jimp')
 
-// Generate a unique pixel pattern for a user
-const generatePixelPattern = (userId, patternSize = 16) => {
-  const pattern = [];
-  let currentSeed = parseInt(userId.toString('hex').substr(0, 8), 16);
-  
-  // Pseudo-random number generator using the seed
-  const random = () => {
-    currentSeed = (currentSeed * 9301 + 49297) % 233280;
-    return currentSeed / 233280;
-  };
+/**
+ * Helper function to embed pixelPattern into image's blue channel LSBs.
+ * @param {Jimp} image - Jimp image object
+ * @param {number[]} pixelPattern - Array of 0s and 1s
+ */
+function embedPixelPattern(image, pixelPattern) {
+  const { width, height } = image.bitmap;
+  const totalPixels = width * height;
 
-  // Generate subtle pixel alterations (values between -2 and 2)
-  for (let i = 0; i < patternSize; i++) {
-    pattern.push(Math.floor(random() * 5) - 2);
-  }
-  
-  return pattern;
-};
-
-// Apply pixel pattern to an image buffer
-const applyPixelPattern = async (imageBuffer, pattern) => {
-  const image = sharp(imageBuffer);
-  const metadata = await image.metadata();
-  
-  // Get raw pixel data
-  const { data, info } = await image
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-
-  // Create a new buffer for the modified image data
-  const modifiedData = Buffer.from(data);
-
-  // Apply pattern to pixels
-  for (let i = 0; i < modifiedData.length; i += info.channels) {
-    const patternIndex = (Math.floor(i / info.channels) % pattern.length);
-    // Only modify blue channel slightly to minimize visibility
-    if (info.channels > 2) { // Ensure image has a blue channel
-      modifiedData[i + 2] = Math.max(0, Math.min(255, modifiedData[i + 2] + pattern[patternIndex]));
-    }
+  if (pixelPattern.length > totalPixels) {
+    throw new Error('Pixel pattern is too long for this image.');
   }
 
-  // Reconstruct image
-  return await sharp(modifiedData, {
-    raw: {
-      width: metadata.width,
-      height: metadata.height,
-      channels: metadata.channels
-    }
-  })
-  .toFormat(metadata.format || 'jpeg')
-  .toBuffer();
-};
+  for (let i = 0; i < pixelPattern.length; i++) {
+    const x = i % width;
+    const y = Math.floor(i / width);
+    const idx = image.getPixelIndex(x, y);
+    const blue = image.bitmap.data[idx + 2];
+    image.bitmap.data[idx + 2] = (blue & 0xFE) | pixelPattern[i];
+  }
+}
 
-// Extract and analyze pixel pattern from image
-const extractPixelPattern = async (imageBuffer, pattern, tolerance = 2) => {
-  const image = await sharp(imageBuffer)
-    .raw()
-    .toBuffer({ resolveWithObject: true });
+/**
+ * Helper function to extract pixelPattern from image's blue channel LSBs.
+ * @param {Jimp} image - Jimp image object
+ * @param {number} length - Number of bits to extract
+ * @returns {number[]} - Extracted pixel pattern
+ */
+function extractPixelPattern(image, length) {
+  const { width, height } = image.bitmap;
+  const totalPixels = width * height;
 
-  const { data } = image;
-  let matches = 0;
-  let totalChecks = Math.floor(data.length / 3);
-  
-  // Check only blue channel values against pattern
-  for (let i = 2; i < data.length; i += 3) {
-    const patternIndex = (Math.floor(i / 3) % pattern.length);
-    const expectedDiff = pattern[patternIndex];
-    const actualValue = data[i];
-    
-    // Check if the pixel value is within tolerance of expected pattern
-    if (Math.abs(actualValue % 5 - (expectedDiff + 2)) <= tolerance) {
-      matches++;
-    }
+  if (length > totalPixels) {
+    throw new Error('Requested pixel pattern length exceeds number of pixels.');
   }
 
-  return matches / totalChecks; // Return match percentage
-};
+  const extracted = [];
+  for (let i = 0; i < length; i++) {
+    const x = i % width;
+    const y = Math.floor(i / width);
+    const idx = image.getPixelIndex(x, y);
+    const blue = image.bitmap.data[idx + 2];
+    extracted.push(blue & 1);
+  }
 
-const uploadImage = async (req, res) => {
+  return extracted;
+}
+
+/**
+ * POST /watermark/upload
+ * Uploads and watermarks an image.
+ */
+exports.uploadImage = async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ message: 'No image file provided' });
+      return res.status(400).json({ message: 'No image uploaded.' });
     }
 
-    const user = await User.findById(req.user.id);
-    
-    try {
-      // Get image metadata
-      const metadata = await sharp(req.file.buffer).metadata();
-      
-      // Generate or retrieve user's pixel pattern
-      let pixelPattern = user.pixelPattern;
-      if (!pixelPattern || pixelPattern.length === 0) {
-        pixelPattern = generatePixelPattern(user._id);
-        await User.findByIdAndUpdate(user._id, { pixelPattern });
-      }
+    const userId = req.user._id;
+    const user = await User.findById(userId);
 
-      // Apply watermark pattern
-      const watermarkedImage = await applyPixelPattern(req.file.buffer, pixelPattern);
+    if (!user) {
+      return res.status(400).json({ message: 'User not found.' });
+    }
 
-      // Save image metadata
-      const image = new Image({
-        userId: user._id,
-        originalName: req.file.originalname,
-        metadata: {
-          timestamp: Date.now(),
-          fileSize: req.file.size,
-          mimeType: metadata.format || 'jpeg',
-          dimensions: {
-            width: metadata.width,
-            height: metadata.height
-          }
+    // Save image to DB
+    const newImage = new Image({
+      userId: user._id,
+      originalName: req.file.originalname,
+      metadata: {
+        timestamp: new Date(),
+        fileSize: req.file.size,
+        mimeType: req.file.mimetype,
+        dimensions: {
+          width: 0, // To be updated after reading image
+          height: 0
         }
-      });
-
-      await image.save();
-      
-      // Update user's image list
-      if (!user.watermarkedImages.includes(image._id)) {
-        await User.findByIdAndUpdate(user._id, {
-          $push: { watermarkedImages: image._id }
-        });
       }
+    });
 
-      // Send response
-      res.set({
-        'Content-Type': `image/${metadata.format || 'jpeg'}`,
-        'Content-Disposition': `attachment; filename="secured_${req.file.originalname}"`,
-        'Cache-Control': 'no-cache'
-      });
-      
-      res.send(watermarkedImage);
+    // Read image to get dimensions
+    const image = await Jimp.read(req.file.path);
+    newImage.metadata.dimensions.width = image.bitmap.width;
+    newImage.metadata.dimensions.height = image.bitmap.height;
 
-    } catch (processingError) {
-      console.error('Processing error:', processingError);
-      throw new Error(`Image processing failed: ${processingError.message}`);
+    // Embed pixelPattern into image
+    if (!user.pixelPattern || user.pixelPattern.length === 0) {
+      return res.status(400).json({ message: 'User pixel pattern not found.' });
     }
+    embedPixelPattern(image, user.pixelPattern);
+    await image.writeAsync(req.file.path); // Overwrite the image with watermark
+
+    const savedImage = await newImage.save();
+
+    // Add to user's watermarkedImages
+    user.watermarkedImages.push(savedImage._id);
+    await user.save();
+
+    res.json({ message: 'Image uploaded and watermarked successfully.', imageUrl: `/uploads/${path.basename(req.file.path)}` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Error uploading and watermarking image.', error: err.message });
+  }
+};
+
+/**
+ * POST /watermark/verify
+ * Verifies the watermark in an uploaded image.
+ */
+exports.verifyImage = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded.' });
+    }
+
+    const userId = req.user._id;
+
+    // Read image buffer using Jimp
+    let image;
+    try {
+      image = await Jimp.read(req.file.buffer);
+    } catch (jimpError) {
+      console.error('Jimp error:', jimpError);
+      return res.status(400).json({ message: 'Invalid image format or corrupted file.' });
+    }
+
+    // Get user and validate pixel pattern
+    const user = await User.findById(userId);
+    if (!user || !user.pixelPattern) {
+      return res.status(400).json({ message: 'User or pixel pattern not found.' });
+    }
+
+    // Extract pixel pattern
+    const extractedPattern = extractPixelPattern(image, user.pixelPattern.length);
+
+    // Compare patterns
+    const isMatch = extractedPattern.every((bit, idx) => bit === user.pixelPattern[idx]);
+
+    return res.status(200).json({
+      verified: isMatch,
+      message: isMatch ? 'Image verified successfully.' : 'Watermark not found or does not match.'
+    });
 
   } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ 
-      message: 'Error processing image',
-      error: error.message
+    console.error('Error in verifyImage:', error);
+    return res.status(500).json({ 
+      message: 'Internal server error during verification.',
+      error: error.message 
     });
   }
 };
-
-const verifyImage = async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ message: 'No image file provided' });
-    }
-
-    try {
-      const metadata = await sharp(req.file.buffer).metadata();
-      const users = await User.find({}).select('_id username email pixelPattern');
-      let foundUser = null;
-      let highestConfidence = 0;
-
-      // Check against each user's pattern
-      for (const user of users) {
-        if (!user.pixelPattern || user.pixelPattern.length === 0) continue;
-
-        const confidence = await extractPixelPattern(req.file.buffer, user.pixelPattern);
-        if (confidence > highestConfidence && confidence > 0.6) { // 60% threshold
-          highestConfidence = confidence;
-          foundUser = user;
-        }
-      }
-
-      const verificationResult = {
-        verified: !!foundUser,
-        confidence: Math.round(highestConfidence * 100),
-        message: foundUser 
-          ? `Image verified with ${Math.round(highestConfidence * 100)}% confidence` 
-          : 'No valid watermark detected',
-        details: {
-          timestamp: new Date(),
-          imageInfo: {
-            name: req.file.originalname,
-            format: metadata.format || 'jpeg',
-            dimensions: {
-              width: metadata.width,
-              height: metadata.height
-            }
-          }
-        }
-      };
-
-      if (foundUser) {
-        verificationResult.details.originalUser = {
-          username: foundUser.username,
-          email: foundUser.email
-        };
-      }
-
-      res.json(verificationResult);
-
-    } catch (error) {
-      throw new Error(`Image analysis failed: ${error.message}`);
-    }
-
-  } catch (error) {
-    console.error('Verification error:', error);
-    res.status(500).json({ 
-      message: 'Error verifying image',
-      error: error.message,
-      details: 'Please ensure you are uploading a valid image file'
-    });
-  }
-};
-
-module.exports = { uploadImage, verifyImage };
